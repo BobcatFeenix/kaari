@@ -7,6 +7,14 @@
 [![Status](https://img.shields.io/badge/Status-Beta%202026-orange)]()
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue)]()
 
+Kaari detects when an AI agent has been redirected from what the user 
+actually asked for. No access to model internals required. Works with 
+any text-in / text-out API.
+
+Built on **Intent Vectoring** — measuring cosine distance between 
+embedded user intent and model response in vector space. If the model 
+went somewhere the user didn't send it, Kaari sees it.
+
 ---
 Kaari scores prompt-response pairs by measuring how far a model's response deviates from the user's original intent in embedding space. No access to model internals needed — works with any LLM.
 
