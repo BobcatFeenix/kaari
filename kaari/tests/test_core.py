@@ -1,5 +1,5 @@
 """
-Kaari Test Suite — Tests detection behavior, not attack taxonomy.
+Kaari Test Suite — Tests detection behavior.
 
 Tests verify:
 1. Math primitives work correctly (cosine, delta, c2)
