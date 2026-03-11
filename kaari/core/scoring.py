@@ -3,7 +3,7 @@ Kaari Scoring Engine
 ====================
 The core product. numpy only.
 
-Measures semantic deviation between user prompt and model response
+Measures the semantic deviation between user prompt and model response
 using cosine distance in embedding space.
 
 Metrics:
