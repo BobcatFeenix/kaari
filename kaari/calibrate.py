@@ -2,7 +2,7 @@
 """
 Kaari Calibration Extractor (C2-A1)
 ====================================
-Computes per-model calibration values from research CSV data.
+Computes per-model calibration values from research data.
 Outputs 7 standardized values per model.
 
 Usage:
