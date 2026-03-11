@@ -1,7 +1,7 @@
 """
 Kaari Scoring Engine
 ====================
-The core product. ~50 lines. numpy only.
+The core product. numpy only.
 
 Measures semantic deviation between user prompt and model response
 using cosine distance in embedding space.
@@ -23,18 +23,103 @@ from typing import Optional
 import numpy as np
 
 
+class KaariError(Exception):
+    """Base exception for Kaari scoring errors."""
+    pass
+
+
+class KaariInputError(KaariError):
+    """Raised when input validation fails.
+
+    Common causes:
+    - Empty or zero-length embedding vectors
+    - Mismatched embedding dimensions between prompt and response
+    - Non-finite values (NaN, Inf) in embedding vectors
+    - Missing required config keys
+    """
+    pass
+
+
 @dataclass
 class ScoringResult:
     """Result of scoring a prompt-response pair."""
-    score: float           # Primary score (C2 for standard, dv2 for fast)
-    risk: int              # 0-100 risk level
-    injected: bool         # Above threshold?
-    family: Optional[str]  # Detected injection family (nasdaq/code/persona/None)
-    confidence: float      # How far above/below threshold (0-1 clamped)
-    delta_v2: float        # Raw Δv2 value
-    delta_v1: Optional[float]  # Δv1 if paranoid tier
-    c2: Optional[float]    # C2 value if standard/paranoid tier
-    tier: str              # Which tier was used
+    injected: bool             # Primary answer: yes/no
+    risk: int                  # 0-100 risk level
+    confidence: float          # Distance from threshold (0-1)
+    score: float               # Primary metric value (dv2 or c2 depending on tier)
+    delta_v2: float            # Raw cosine distance
+    c2: Optional[float]        # Length-normalized (None if fast tier)
+    delta_v1: Optional[float]  # Intent embedding delta (None unless paranoid)
+    tier: str                  # "fast" | "standard" | "paranoid"
+
+
+def _validate_embedding(embedding, name: str) -> np.ndarray:
+    """Validate and convert an embedding to a numpy array.
+
+    Args:
+        embedding: The embedding vector to validate.
+        name: Human-readable name for error messages (e.g., "prompt_embedding").
+
+    Returns:
+        Validated numpy array.
+
+    Raises:
+        KaariInputError: If the embedding is invalid.
+    """
+    if embedding is None:
+        raise KaariInputError(
+            f"{name} is None. Check that your embedding provider returned "
+            f"a result — the model may not be loaded or reachable."
+        )
+
+    arr = np.asarray(embedding, dtype=np.float64)
+
+    if arr.ndim == 0 or arr.size == 0:
+        raise KaariInputError(
+            f"{name} is empty (size={arr.size}). The embedding provider "
+            f"returned no data. Verify the provider is running and the "
+            f"input text is not empty."
+        )
+
+    if arr.ndim != 1:
+        raise KaariInputError(
+            f"{name} has wrong shape: {arr.shape}. Expected a 1-D vector. "
+            f"If you're passing a batch, pass one embedding at a time."
+        )
+
+    if not np.all(np.isfinite(arr)):
+        nan_count = int(np.sum(np.isnan(arr)))
+        inf_count = int(np.sum(np.isinf(arr)))
+        raise KaariInputError(
+            f"{name} contains non-finite values ({nan_count} NaN, {inf_count} Inf). "
+            f"This usually means the embedding model produced corrupt output. "
+            f"Try re-embedding, or check your embedding provider."
+        )
+
+    if np.linalg.norm(arr) == 0:
+        raise KaariInputError(
+            f"{name} is a zero vector (all values are 0.0). The embedding "
+            f"model returned a meaningless result. Check that your input text "
+            f"is not empty and the model supports your input language."
+        )
+
+    return arr
+
+
+def _validate_embedding_pair(v1: np.ndarray, v2: np.ndarray,
+                              name1: str, name2: str) -> None:
+    """Validate that two embeddings are compatible for comparison.
+
+    Raises:
+        KaariInputError: If dimensions don't match.
+    """
+    if v1.shape != v2.shape:
+        raise KaariInputError(
+            f"Dimension mismatch: {name1} has {v1.shape[0]} dimensions, "
+            f"{name2} has {v2.shape[0]}. Both embeddings must come from "
+            f"the same provider/model. If you switched providers mid-pipeline, "
+            f"re-embed both texts with the same provider."
+        )
 
 
 def cosine_similarity(v1, v2) -> float:
@@ -85,8 +170,34 @@ def score(
     Returns:
         ScoringResult with score, risk level, injection flag, and metadata.
     """
+    # --- Input validation ---
+    p_emb = _validate_embedding(prompt_embedding, "prompt_embedding")
+    r_emb = _validate_embedding(response_embedding, "response_embedding")
+    _validate_embedding_pair(p_emb, r_emb, "prompt_embedding", "response_embedding")
+
+    if response_length < 0:
+        raise KaariInputError(
+            f"response_length is negative ({response_length}). "
+            f"Pass len(response_text) — it must be >= 0."
+        )
+
+    _REQUIRED_CONFIG_KEYS = {"threshold_dv2", "threshold_c2", "clean_length_mean"}
+    missing = _REQUIRED_CONFIG_KEYS - set(config.keys())
+    if missing:
+        raise KaariInputError(
+            f"Config missing required keys: {missing}. "
+            f"Use kaari.core.thresholds.get_config() to get a valid config, "
+            f"or ensure your custom config includes all required keys."
+        )
+
+    if tier == "paranoid" and response_intent_embedding is not None:
+        ri_emb = _validate_embedding(response_intent_embedding, "response_intent_embedding")
+        _validate_embedding_pair(p_emb, ri_emb, "prompt_embedding", "response_intent_embedding")
+
+    # --- Scoring ---
+
     # Δv2: prompt vs raw response (the core signal)
-    dv2 = calculate_delta(prompt_embedding, response_embedding)
+    dv2 = calculate_delta(p_emb, r_emb)
 
     # Tier-specific scoring
     if tier == "fast":
@@ -104,7 +215,7 @@ def score(
     elif tier == "paranoid":
         c2_val = calculate_c2(dv2, response_length, config["clean_length_mean"])
         if response_intent_embedding is not None:
-            dv1_val = calculate_delta(prompt_embedding, response_intent_embedding)
+            dv1_val = calculate_delta(p_emb, response_intent_embedding)
             # Paranoid: weighted combination of C2 and Δv1
             primary_score = 0.7 * c2_val + 0.3 * dv1_val
         else:
@@ -128,13 +239,12 @@ def score(
     risk = min(100, max(0, int(100 * primary_score / max(threshold * 2, 0.001))))
 
     return ScoringResult(
-        score=primary_score,
-        risk=risk,
         injected=injected,
-        family=None,  # Filled by families.py in the pipeline
+        risk=risk,
         confidence=confidence,
+        score=primary_score,
         delta_v2=dv2,
-        delta_v1=dv1_val,
         c2=c2_val,
+        delta_v1=dv1_val,
         tier=tier,
     )

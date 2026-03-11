@@ -28,9 +28,8 @@ import functools
 import logging
 from typing import Optional, Callable
 
-from kaari.core.scoring import score, ScoringResult
+from kaari.core.scoring import score, ScoringResult, KaariError, KaariInputError
 from kaari.core.thresholds import get_config
-from kaari.core.families import detect_family
 from kaari.embeddings.base import EmbeddingProvider, EmbeddingError
 from kaari.embeddings.ollama import OllamaEmbedding
 
@@ -80,9 +79,38 @@ class Kaari:
         """
         tier = tier or self._tier
 
+        # Validate inputs
+        if not prompt or not prompt.strip():
+            raise KaariInputError(
+                "Prompt is empty. Kaari needs the user's original prompt text "
+                "to measure whether the response drifted from it."
+            )
+        if not response or not response.strip():
+            raise KaariInputError(
+                "Response is empty. No model output to score. Check that your "
+                "LLM returned a response before passing it to Kaari."
+            )
+
         # Embed prompt and response
-        prompt_emb = self._embedding.embed(prompt)
-        response_emb = self._embedding.embed(response)
+        try:
+            prompt_emb = self._embedding.embed(prompt)
+        except EmbeddingError:
+            raise
+        except Exception as e:
+            raise KaariError(
+                f"Failed to embed prompt: {e}. Check that your embedding "
+                f"provider ({self._embedding.name}) is running and reachable."
+            ) from e
+
+        try:
+            response_emb = self._embedding.embed(response)
+        except EmbeddingError:
+            raise
+        except Exception as e:
+            raise KaariError(
+                f"Failed to embed response: {e}. Check that your embedding "
+                f"provider ({self._embedding.name}) is running and reachable."
+            ) from e
 
         # Response intent embedding for paranoid tier
         response_intent_emb = None
@@ -102,11 +130,6 @@ class Kaari:
             response_intent_embedding=response_intent_emb,
             tier=tier,
         )
-
-        # Family detection (only if injection detected)
-        if result.injected:
-            family_result = detect_family(response)
-            result.family = family_result.family
 
         return result
 
@@ -149,7 +172,7 @@ class Kaari:
                     if result.injected:
                         logger.warning(
                             f"Kaari: injection detected (score={result.score:.4f}, "
-                            f"risk={result.risk}, family={result.family})"
+                            f"risk={result.risk}, tier={result.tier})"
                         )
                     return response
                 else:
@@ -174,7 +197,7 @@ class Kaari:
         if self._on_inject == "warn":
             logger.warning(
                 f"Kaari injection detected: score={result.score:.4f}, "
-                f"risk={result.risk}, family={result.family}, tier={result.tier}"
+                f"risk={result.risk}, tier={result.tier}"
             )
         elif self._on_inject == "raise":
             raise InjectionDetected(result)
@@ -195,5 +218,5 @@ class InjectionDetected(Exception):
         self.result = result
         super().__init__(
             f"Injection detected: score={result.score:.4f}, "
-            f"risk={result.risk}, family={result.family}"
+            f"risk={result.risk}, tier={result.tier}"
         )

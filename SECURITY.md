@@ -37,7 +37,7 @@ Kaari is **not a firewall, filter, or safety guarantee**.
 
 4. **Simple prompt bias.** Research used short, single-turn prompts. Performance on long documents, multi-turn conversations, or system prompts with extensive context is not yet validated.
 
-5. **Family detection is keyword-based.** Novel injection families not in the keyword set will be detected as injections (if Δv2 is high enough) but won't be classified into a family.
+5. **Detection is embedding-model-dependent.** Separation quality varies by embedding model. Results are validated with nomic-embed-text; other models may require recalibration.
 
 ## Reporting Vulnerabilities
 
@@ -53,11 +53,11 @@ Please include:
 
 ## Accuracy Statement
 
-As of v0.1.0, Kaari achieves:
+As of v0.2.0, Kaari achieves:
 
 | Metric | Value | Conditions |
 |--------|-------|------------|
-| AUC-ROC (C2) | 0.883 | N=1,944, 4 models, 3 families |
+| AUC-ROC (C2) | 0.883 | N=1,944, 4 models |
 | Cohen's d | 1.72 | Combined effective |
 | Sensitivity | ~0.65 | At Youden-optimal threshold |
 | Specificity | ~0.83 | At Youden-optimal threshold |

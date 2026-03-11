@@ -24,8 +24,9 @@ References:
     Detection via Semantic Deviation Measurement."
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 
-from kaari.client import Kaari
+from kaari.client import Kaari, InjectionDetected
+from kaari.core.scoring import KaariError, KaariInputError
 
-__all__ = ["Kaari", "__version__"]
+__all__ = ["Kaari", "InjectionDetected", "KaariError", "KaariInputError", "__version__"]

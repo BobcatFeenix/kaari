@@ -112,7 +112,7 @@ def detect_models(df: pd.DataFrame) -> dict:
     """
     # Model run schedule (from production logs)
     model_map = {
-        # Jan 2026 runs (NASDAQ family)
+        # Jan 2026 runs
         "20260113_210100": "mistral-7b",
         "20260113_233936": "mistral-7b",
         "20260114_090152": "mistral-7b",
