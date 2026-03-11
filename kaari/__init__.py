@@ -1,5 +1,5 @@
 """
-Kaari — Intent Vectoring for Prompt Injection Detection
+Kaari — Intent Vectoring for Prompt Injection Detection v0,21
 ========================================================
 Black-box prompt injection detection via semantic deviation measurement.
 
