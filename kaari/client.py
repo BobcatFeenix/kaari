@@ -1,5 +1,5 @@
 """
-Kaari Client v0.95 — The public interface.
+Kaari Client v0.97 — The public interface.
 ===========================================
 
 Usage:
@@ -7,12 +7,23 @@ Usage:
 
     # Basic scoring (standard tier, default)
     k = kaari.Kaari()
+    # -> "KAARI v0.97 online. Detection active (standard tier, threshold 0.245).
+    #     GREEN/YELLOW/RED zone alerts will appear here."
+
     result = k.score("What is 2+2?", "The answer is 4.")
     print(result.zone)  # "green" — clean
 
-    # With specific model calibration
-    k = kaari.Kaari(model="mistral-7b")
-    result = k.score(prompt, response)
+    # Pause/resume detection
+    k.pause()    # Silences all scoring — returns neutral results
+    k.resume()   # Reactivates detection
+
+    # Usage report
+    k = kaari.Kaari(reporting=True)
+    # ... after scoring ...
+    k.report()   # Prints scan counts by zone
+
+    # Status check
+    k.status()   # Prints current config, state, scan count
 
     # Configure what happens on RED zone detection
     k = kaari.Kaari(on_red="log")       # Default: log alert, continue
@@ -30,10 +41,12 @@ Usage:
 
 import functools
 import logging
+import sys
+import time
 from typing import Optional, Callable, Union
 
 from kaari.core.scoring import score, ScoringResult, KaariError, KaariInputError
-from kaari.core.thresholds import get_config
+from kaari.core.thresholds import get_config, ZONE_GREEN_MAX, ZONE_YELLOW_MAX
 from kaari.embeddings.base import EmbeddingProvider, EmbeddingError
 from kaari.embeddings.ollama import OllamaEmbedding
 
@@ -55,6 +68,8 @@ class Kaari:
                     - "log" (default): logs the alert, returns result, process continues
                     - "raise": raises KaariInjectionAlert exception
                     - callable: your function(prompt, response, result) is called
+        reporting:  Enable usage reporting (default: False). When True, Kaari
+                    tracks scan counts by zone. Call k.report() to see results.
     """
 
     def __init__(
@@ -63,6 +78,7 @@ class Kaari:
         model: Optional[str] = None,
         tier: str = "standard",
         on_red: Union[str, Callable] = "log",
+        reporting: bool = False,
     ):
         if tier == "paranoid":
             logger.info(
@@ -75,6 +91,21 @@ class Kaari:
         self._model = model
         self._tier = tier
         self._on_red = on_red
+        self._paused = False
+        self._started_at = time.time()
+
+        # Reporting
+        self._reporting = reporting
+        self._scan_counts = {"green": 0, "yellow": 0, "red": 0, "paused": 0}
+
+        # Welcome message
+        from kaari import __version__
+        threshold = self._config.get("threshold_c2", ZONE_YELLOW_MAX)
+        sys.stderr.write(
+            f"\n  KAARI v{__version__} online. "
+            f"Detection active ({tier} tier, threshold {threshold:.3f}). "
+            f"GREEN/YELLOW/RED zone alerts will appear here.\n\n"
+        )
 
     def score(
         self,
@@ -92,8 +123,24 @@ class Kaari:
 
         Returns:
             ScoringResult with score, risk, injected flag, and metadata.
+            If paused, returns a neutral green result without embedding.
         """
         tier = tier or self._tier
+
+        # If paused, return neutral result without doing any work
+        if self._paused:
+            self._scan_counts["paused"] += 1
+            return ScoringResult(
+                injected=False,
+                zone="green",
+                risk=0,
+                confidence=0.0,
+                score=0.0,
+                delta_v2=0.0,
+                c2=0.0 if tier != "fast" else None,
+                delta_v1=None,
+                tier=tier,
+            )
 
         # Validate inputs
         if not prompt or not prompt.strip():
@@ -146,6 +193,9 @@ class Kaari:
             response_intent_embedding=response_intent_emb,
             tier=tier,
         )
+
+        # Track scan counts
+        self._scan_counts[result.zone] += 1
 
         # Handle red zone
         if result.zone == "red":
@@ -202,6 +252,123 @@ class Kaari:
             return decorator(func)
         return decorator
 
+    # ------------------------------------------------------------------
+    # Pause / Resume
+    # ------------------------------------------------------------------
+
+    def pause(self):
+        """Pause detection. score() returns neutral green results without embedding.
+
+        Use this to temporarily disable Kaari without removing it from your pipeline.
+        """
+        if not self._paused:
+            self._paused = True
+            sys.stderr.write(
+                "\n  KAARI: Detection paused. "
+                "Scoring will return neutral results until k.resume() is called.\n\n"
+            )
+
+    def resume(self):
+        """Resume detection after pause."""
+        if self._paused:
+            self._paused = False
+            sys.stderr.write(
+                "\n  KAARI: Detection resumed. "
+                "Scoring is active.\n\n"
+            )
+
+    @property
+    def is_paused(self) -> bool:
+        """Whether detection is currently paused."""
+        return self._paused
+
+    # ------------------------------------------------------------------
+    # Status
+    # ------------------------------------------------------------------
+
+    def status(self):
+        """Print current Kaari configuration and state to terminal."""
+        from kaari import __version__
+        total = sum(self._scan_counts[z] for z in ("green", "yellow", "red"))
+        paused_count = self._scan_counts["paused"]
+        uptime = time.time() - self._started_at
+        minutes = int(uptime // 60)
+        seconds = int(uptime % 60)
+
+        state = "PAUSED" if self._paused else "ACTIVE"
+        threshold = self._config.get("threshold_c2", ZONE_YELLOW_MAX)
+
+        lines = [
+            f"",
+            f"  KAARI v{__version__} — Status",
+            f"  State:      {state}",
+            f"  Tier:       {self._tier}",
+            f"  Threshold:  {threshold:.3f}",
+            f"  Zones:      GREEN < {ZONE_GREEN_MAX} | YELLOW {ZONE_GREEN_MAX}-{ZONE_YELLOW_MAX} | RED >= {ZONE_YELLOW_MAX}",
+            f"  Embedding:  {self._embedding.name}",
+            f"  On RED:     {self._on_red if isinstance(self._on_red, str) else 'callback'}",
+            f"  Reporting:  {'ON' if self._reporting else 'OFF'}",
+            f"  Scans:      {total} scored ({paused_count} skipped while paused)",
+            f"  Uptime:     {minutes}m {seconds}s",
+            f"",
+        ]
+        sys.stderr.write("\n".join(lines) + "\n")
+
+    # ------------------------------------------------------------------
+    # Usage Report
+    # ------------------------------------------------------------------
+
+    def report(self):
+        """Print usage report to terminal.
+
+        Shows scan counts by zone. Only tracks when reporting=True,
+        but zone counts are always maintained internally.
+        """
+        from kaari import __version__
+        total = sum(self._scan_counts[z] for z in ("green", "yellow", "red"))
+        paused_count = self._scan_counts["paused"]
+        uptime = time.time() - self._started_at
+        minutes = int(uptime // 60)
+        seconds = int(uptime % 60)
+
+        if total == 0 and paused_count == 0:
+            sys.stderr.write(
+                "\n  KAARI Report: No scans performed yet.\n\n"
+            )
+            return
+
+        green = self._scan_counts["green"]
+        yellow = self._scan_counts["yellow"]
+        red = self._scan_counts["red"]
+
+        lines = [
+            f"",
+            f"  KAARI v{__version__} — Usage Report",
+            f"  {'=' * 40}",
+            f"  Total scans:    {total}",
+            f"  GREEN (clean):  {green:>6}  ({_pct(green, total)})",
+            f"  YELLOW (review):{yellow:>6}  ({_pct(yellow, total)})",
+            f"  RED (alert):    {red:>6}  ({_pct(red, total)})",
+        ]
+        if paused_count > 0:
+            lines.append(
+                f"  Skipped (paused): {paused_count}"
+            )
+        lines.extend([
+            f"  {'=' * 40}",
+            f"  Session duration: {minutes}m {seconds}s",
+            f"",
+        ])
+        sys.stderr.write("\n".join(lines) + "\n")
+
+    def reset_counts(self):
+        """Reset scan counters to zero."""
+        self._scan_counts = {"green": 0, "yellow": 0, "red": 0, "paused": 0}
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
     def _handle_red(self, prompt: str, response: str, result: ScoringResult):
         """Handle RED zone detection based on configured policy.
 
@@ -221,15 +388,23 @@ class Kaari:
             self._on_red(prompt, response, result)
 
     def __repr__(self):
+        state = "paused" if self._paused else "active"
         return (
             f"Kaari(embedding={self._embedding.name}, "
             f"model={self._model}, tier={self._tier}, "
-            f"on_red={self._on_red})"
+            f"on_red={self._on_red}, state={state})"
         )
 
 
+def _pct(count: int, total: int) -> str:
+    """Format a percentage string."""
+    if total == 0:
+        return "  0.0%"
+    return f"{100 * count / total:5.1f}%"
+
+
 class InjectionDetected(Exception):
-    """Raised when injection is detected and on_inject='raise'."""
+    """Raised when injection is detected and on_red='raise'."""
 
     def __init__(self, result: ScoringResult):
         self.result = result

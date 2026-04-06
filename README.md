@@ -1,10 +1,10 @@
-# Kaari v0.95
+# Kaari v0.97
 
 **Black-box prompt injection detection for AI agent pipelines via semantic deviation measurement.**
 
 [![Paper](https://img.shields.io/badge/Paper-SSRN%20Preprint-blue)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6280858)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-v0.95%20RC-orange)]()
+[![Status](https://img.shields.io/badge/Status-v0.97-orange)]()
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue)]()
 
 Kaari detects when an AI agent has been redirected from what the user actually asked for. No access to model internals required. Works with any text-in / text-out API.
@@ -17,7 +17,7 @@ Based on the Intent Vectoring research (N=2,228, C2 AUC 0.822). Validated across
 
 ## Zone System
 
-Kaari v0.95 uses a three-zone traffic light system instead of a binary yes/no:
+Kaari uses a three-zone traffic light system instead of a binary yes/no:
 
 | Zone | C2 Score | What It Means | Terminal Output |
 |------|----------|---------------|-----------------|
@@ -67,6 +67,36 @@ print(result.zone)       # "green"
 print(result.injected)   # False
 print(result.risk)       # 8
 print(result.delta_v2)   # 0.0812
+```
+
+### Try the demo
+
+Kaari ships with three test documents that demonstrate each zone. Run the demo to see what GREEN, YELLOW, and RED look like in your terminal:
+
+```bash
+python -m kaari.test_cases.run_demo
+```
+
+The test documents contain the same base text (a project status update). Two of them have hidden injection content — text that would be white-on-white in a real document, invisible to the human reader but processed by the LLM. Kaari detects the deviation in the response.
+
+### Pause and resume
+
+```python
+k.pause()    # Silences detection — score() returns neutral green results
+k.resume()   # Reactivates detection
+```
+
+Use this when you want to temporarily disable Kaari without removing it from your pipeline.
+
+### Status and reporting
+
+```python
+k.status()   # Prints current config, tier, state, scan count
+
+# Enable reporting to track scan counts
+k = kaari.Kaari(reporting=True)
+# ... after some scoring ...
+k.report()   # Prints scan counts by zone
 ```
 
 ### Guard an LLM call

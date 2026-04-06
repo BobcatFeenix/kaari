@@ -1,5 +1,5 @@
 """
-Kaari Test Suite v0.95 — Tests detection behavior.
+Kaari Test Suite v0.97 — Tests detection behavior.
 
 Tests verify:
 1. Math primitives work correctly (cosine, delta, c2)
@@ -7,13 +7,16 @@ Tests verify:
 3. Drifted inputs score HIGH (red zone)
 4. Zone classification works correctly
 5. Tier logic routes correctly
-6. Edge cases don't crash
-7. Input validation catches bad data with actionable errors
+6. Pause/resume works correctly
+7. Reporting tracks scan counts
+8. Edge cases don't crash
+9. Input validation catches bad data with actionable errors
 
 Run: pytest kaari/tests/ -v
 """
 
 import math
+import sys
 import numpy as np
 import pytest
 
@@ -390,6 +393,116 @@ class TestInputValidation:
     def test_kaari_error_hierarchy(self):
         """KaariInputError should be catchable as KaariError."""
         assert issubclass(KaariInputError, KaariError)
+
+
+# --- Pause / Resume / Reporting (client-level, uses mock embedding) ---
+
+
+class _MockEmbedding:
+    """Minimal embedding provider for client tests without Ollama."""
+
+    def embed(self, text: str):
+        # Deterministic: hash text to produce a pseudo-embedding
+        import hashlib
+        h = hashlib.sha256(text.encode()).digest()
+        vec = np.array([float(b) / 255.0 for b in h[:384]], dtype=np.float64)
+        # Ensure non-zero
+        vec[0] = max(vec[0], 0.01)
+        return vec / np.linalg.norm(vec)
+
+    @property
+    def dimension(self):
+        return 384
+
+    @property
+    def name(self):
+        return "mock-test"
+
+
+class TestPauseResume:
+    def _make_client(self):
+        from kaari.client import Kaari
+        import kaari.core.scoring as sm
+        sm.TERMINAL_ALERTS_ENABLED = False
+        # Redirect stderr to suppress welcome message
+        import io
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        k = Kaari(embedding=_MockEmbedding())
+        sys.stderr = old_stderr
+        return k
+
+    def test_pause_returns_green(self):
+        k = self._make_client()
+        k.pause()
+        result = k.score("test prompt", "test response")
+        assert result.zone == "green"
+        assert result.injected is False
+        assert result.score == 0.0
+
+    def test_resume_reactivates(self):
+        k = self._make_client()
+        k.pause()
+        assert k.is_paused is True
+        k.resume()
+        assert k.is_paused is False
+        # After resume, scoring should actually compute
+        result = k.score("test prompt", "test response")
+        assert result.score != 0.0  # Should have a real score now
+
+    def test_paused_count_tracked(self):
+        k = self._make_client()
+        k.pause()
+        k.score("a", "b")
+        k.score("c", "d")
+        assert k._scan_counts["paused"] == 2
+
+
+class TestReporting:
+    def _make_client(self):
+        from kaari.client import Kaari
+        import kaari.core.scoring as sm
+        sm.TERMINAL_ALERTS_ENABLED = False
+        import io
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        k = Kaari(embedding=_MockEmbedding(), reporting=True)
+        sys.stderr = old_stderr
+        return k
+
+    def test_scan_counts_increment(self):
+        k = self._make_client()
+        k.score("hello", "world")
+        total = sum(k._scan_counts[z] for z in ("green", "yellow", "red"))
+        assert total == 1
+
+    def test_reset_counts(self):
+        k = self._make_client()
+        k.score("hello", "world")
+        k.reset_counts()
+        total = sum(k._scan_counts[z] for z in ("green", "yellow", "red"))
+        assert total == 0
+
+    def test_report_runs_without_error(self):
+        k = self._make_client()
+        k.score("hello", "world")
+        import io
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        k.report()  # Should not raise
+        output = sys.stderr.getvalue()
+        sys.stderr = old_stderr
+        assert "Usage Report" in output
+
+    def test_status_runs_without_error(self):
+        k = self._make_client()
+        import io
+        old_stderr = sys.stderr
+        sys.stderr = io.StringIO()
+        k.status()  # Should not raise
+        output = sys.stderr.getvalue()
+        sys.stderr = old_stderr
+        assert "ACTIVE" in output
 
 
 # --- Integration: real embeddings (requires Ollama running) ---
