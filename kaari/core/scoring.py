@@ -58,6 +58,7 @@ class ScoringResult:
     c2: Optional[float]        # Length-normalized (None if fast tier)
     delta_v1: Optional[float]  # Intent embedding delta (None unless paranoid)
     tier: str                  # "fast" | "standard" | "paranoid"
+    deviation_ratio: Optional[float] = None  # Score relative to clean baseline (1.0 = normal)
 
 
 def _validate_embedding(embedding, name: str) -> np.ndarray:

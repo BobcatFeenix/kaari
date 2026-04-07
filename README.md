@@ -1,10 +1,10 @@
-# Kaari v0.97
+# Kaari v0.98
 
 **Black-box prompt injection detection for AI agent pipelines via semantic deviation measurement.**
 
 [![Paper](https://img.shields.io/badge/Paper-SSRN%20Preprint-blue)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6280858)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![Status](https://img.shields.io/badge/Status-v0.97-orange)]()
+[![Status](https://img.shields.io/badge/Status-v0.98-orange)]()
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue)]()
 
 Kaari detects when an AI agent has been redirected from what the user actually asked for. No access to model internals required. Works with any text-in / text-out API.
@@ -78,6 +78,42 @@ python -m kaari.test_cases.run_demo
 ```
 
 The test documents contain the same base text (a project status update). Two of them have hidden injection content — text that would be white-on-white in a real document, invisible to the human reader but processed by the LLM. Kaari detects the deviation in the response.
+
+### Calibrate from your data (recommended)
+
+Default thresholds are calibrated on research data. Your pipeline will have different clean-score distributions depending on prompt style, response length, and embedding model. Calibrating from your own data gives Kaari a baseline that matches your specific setup.
+
+Pass 10-50 known-clean (prompt, response) pairs:
+
+```python
+k = kaari.Kaari()
+
+k.calibrate([
+    ("Summarize this report.\n\n<report text>", "The report shows quarterly growth..."),
+    ("What are the key risks?\n\n<report text>", "Three risks were identified..."),
+    ("List action items.\n\n<report text>", "The team needs to complete..."),
+    # ... 10-50 representative clean pairs from your pipeline
+])
+
+# Now k.score() uses thresholds derived from YOUR data.
+# Zone boundaries = clean_mean + N × clean_std
+```
+
+After calibration, each scoring result includes a `deviation_ratio` — how many times the baseline the response deviates:
+
+```python
+result = k.score(prompt, response)
+print(result.deviation_ratio)  # 1.0× = normal, 2.0× = double baseline, etc.
+```
+
+The deviation ratio is a universal signal that normalizes across pipelines. A ratio of 1.0× means the response deviates about as much as your clean samples. A ratio ≥ 2.0× indicates the response has drifted significantly from the user's intent.
+
+If you just want deviation ratios without changing zone thresholds, use `set_baseline()` with a single clean pair:
+
+```python
+k.set_baseline("Summarize this doc.\n\n<text>", "The document describes...")
+# deviation_ratio now appears in all scoring results
+```
 
 ### Pause and resume
 
@@ -224,6 +260,25 @@ class MyEmbedding(EmbeddingProvider):
 k = kaari.Kaari(embedding=MyEmbedding())
 ```
 
+## What to Pass as the Prompt
+
+This matters. Kaari measures the cosine distance between the embedded prompt and the embedded response. If the prompt you pass to `k.score()` is too short or too generic, the distance will be large even for clean responses — because there's not enough semantic content in the prompt to anchor against.
+
+**Rule: pass the full user intent, not just the instruction.**
+
+If your user says "Summarize this document" and you send the document to the LLM as context, the prompt you pass to Kaari should include both the instruction *and* the document content:
+
+```python
+# WRONG — generic instruction, high distance to any detailed response
+result = k.score("Summarize this document", response)
+
+# RIGHT — full intent includes the source material
+prompt_for_kaari = f"Summarize this document.\n\n{document_text}"
+result = k.score(prompt_for_kaari, response)
+```
+
+The same applies to RAG pipelines, tool-use chains, and any setup where the user's intent is distributed across multiple inputs. Concatenate everything the model saw that represents the user's intent into one string. Kaari needs the semantic anchoring point — the richer the prompt, the more meaningful the distance measurement.
+
 ## Integration
 
 Kaari sits between your LLM call and your user. Score the response *before* showing it.
@@ -306,10 +361,11 @@ Kaari is a **post-hoc analysis tool** that scores responses after generation. It
 
 **Known limitations:**
 
+- **Subtle influence injection** (nudging rather than hijacking) produces deviation ratios close to 1.0×, making it hard to distinguish from natural divergence using embedding geometry alone. Kaari reliably detects full hijacks (ratio ≥ 2.0×) but not subtle reframing. Multi-signal detection (VF/Sg) is in development to address this gap.
 - **Subtle code injection** is harder to detect. Code injection is functionally motivated, not semantically divergent — the response can execute harmful code while staying on-topic. This is an inherent limit of embedding-geometry detection. Defense against code injection requires input filtering and sandboxing, not post-response analysis.
 - **File-based injection** has the lowest detection rate among tested attack types.
 - **Simple test prompts** in research (single-turn, short). Long-document and multi-turn scenarios need further validation.
-- **Threshold calibration matters.** The default threshold (0.245) is calibrated on research data with specific models and prompt types. Your deployment may need different thresholds. Run `python -m kaari.calibrate` on your own data.
+- **Threshold calibration matters.** Default thresholds are calibrated on research data. Use `k.calibrate()` with your own clean data for production deployments. The deviation ratio provides a pipeline-independent signal that normalizes across different setups.
 
 **Validated embedding models:** nomic-embed-text, all-MiniLM-L6-v2, bge-base-en-v1.5. Detection is encoder-independent (AUC spread +/-0.006), but optimal thresholds vary per model.
 

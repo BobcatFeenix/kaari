@@ -1,5 +1,5 @@
 """
-Kaari Client v0.97 — The public interface.
+Kaari Client v0.98 — The public interface.
 ===========================================
 
 Usage:
@@ -7,11 +7,21 @@ Usage:
 
     # Basic scoring (standard tier, default)
     k = kaari.Kaari()
-    # -> "KAARI v0.97 online. Detection active (standard tier, threshold 0.245).
+    # -> "KAARI v0.98 online. Detection active (standard tier, threshold 0.245).
     #     GREEN/YELLOW/RED zone alerts will appear here."
 
     result = k.score("What is 2+2?", "The answer is 4.")
     print(result.zone)  # "green" — clean
+
+    # Calibrate from your own clean data (recommended)
+    # Pass representative clean (prompt, response) pairs from your pipeline.
+    # Kaari computes your baseline and adjusts thresholds accordingly.
+    k.calibrate([
+        ("Summarize this report. <report text>", "The report shows..."),
+        ("What are the action items?", "Three items need attention..."),
+        # ... 10-50 representative pairs
+    ])
+    # Thresholds now reflect YOUR pipeline's clean distribution.
 
     # Pause/resume detection
     k.pause()    # Silences all scoring — returns neutral results
@@ -41,9 +51,10 @@ Usage:
 
 import functools
 import logging
+import math
 import sys
 import time
-from typing import Optional, Callable, Union
+from typing import Optional, Callable, Union, List, Tuple
 
 from kaari.core.scoring import score, ScoringResult, KaariError, KaariInputError
 from kaari.core.thresholds import get_config, ZONE_GREEN_MAX, ZONE_YELLOW_MAX
@@ -93,6 +104,10 @@ class Kaari:
         self._on_red = on_red
         self._paused = False
         self._started_at = time.time()
+        self._calibrated = False
+        self._baseline_score = None
+        self._zone_green_max = ZONE_GREEN_MAX
+        self._zone_yellow_max = ZONE_YELLOW_MAX
 
         # Reporting
         self._reporting = reporting
@@ -184,7 +199,12 @@ class Kaari:
             # Future: optional LLM summarization for paid paranoid tier.
             pass
 
-        # Score
+        # Score — if calibrated, suppress core-level zone alerts
+        # (they'd use default thresholds; we reclassify with calibrated ones)
+        from kaari.core import scoring as _scoring_mod
+        if self.is_calibrated:
+            _scoring_mod.TERMINAL_ALERTS_ENABLED = False
+
         result = score(
             prompt_embedding=prompt_emb,
             response_embedding=response_emb,
@@ -193,6 +213,15 @@ class Kaari:
             response_intent_embedding=response_intent_emb,
             tier=tier,
         )
+
+        if self.is_calibrated:
+            _scoring_mod.TERMINAL_ALERTS_ENABLED = True
+            # Re-classify zone using calibrated boundaries
+            result = self._reclassify(result)
+
+        # Compute deviation ratio if baseline exists
+        if self._baseline_score is not None and self._baseline_score > 0:
+            result.deviation_ratio = round(result.score / self._baseline_score, 2)
 
         # Track scan counts
         self._scan_counts[result.zone] += 1
@@ -283,6 +312,209 @@ class Kaari:
         return self._paused
 
     # ------------------------------------------------------------------
+    # Calibration
+    # ------------------------------------------------------------------
+
+    def calibrate(
+        self,
+        samples: List[Tuple[str, str]],
+        sigma_yellow: float = 2.0,
+        sigma_red: float = 3.0,
+    ) -> dict:
+        """Calibrate Kaari from your pipeline's clean data.
+
+        Computes baseline statistics from known-clean (prompt, response)
+        pairs and adjusts thresholds to match your specific pipeline's
+        distribution. This replaces the generic default thresholds with
+        values derived from YOUR data.
+
+        After calibration, zone boundaries are set relative to your clean
+        baseline:
+            - GREEN:  C2 < clean_mean + sigma_yellow × clean_std
+            - YELLOW: between green and red boundaries
+            - RED:    C2 >= clean_mean + sigma_red × clean_std
+
+        Args:
+            samples:      List of (prompt, response) tuples. These MUST be
+                          known-clean pairs — no injections. 10 minimum,
+                          20-50 recommended for stable statistics.
+            sigma_yellow: Standard deviations above mean for yellow zone
+                          (default: 2.0).
+            sigma_red:    Standard deviations above mean for red zone
+                          (default: 3.0).
+
+        Returns:
+            Dict with computed calibration values for inspection.
+
+        Raises:
+            KaariInputError: If fewer than 10 samples provided.
+
+        Example:
+            k = kaari.Kaari()
+            k.calibrate([
+                ("Summarize this report. <text>", "The report shows..."),
+                ("What are the key risks?", "Three risks were identified..."),
+                # ... more representative clean pairs
+            ])
+            # Now k.score() uses calibrated thresholds
+        """
+        if len(samples) < 10:
+            raise KaariInputError(
+                f"Calibration requires at least 10 clean samples, got {len(samples)}. "
+                f"More samples = more stable thresholds. 20-50 recommended."
+            )
+
+        import numpy as np
+        from kaari.core.scoring import calculate_delta, calculate_c2
+
+        dv2_values = []
+        c2_values = []
+        lengths = []
+
+        sys.stderr.write(
+            f"\n  KAARI: Calibrating from {len(samples)} clean samples...\n"
+        )
+
+        for i, (prompt, response) in enumerate(samples):
+            if not prompt or not prompt.strip():
+                logger.warning(f"Calibration sample {i}: empty prompt, skipping.")
+                continue
+            if not response or not response.strip():
+                logger.warning(f"Calibration sample {i}: empty response, skipping.")
+                continue
+
+            try:
+                p_emb = self._embedding.embed(prompt)
+                r_emb = self._embedding.embed(response)
+            except Exception as e:
+                logger.warning(f"Calibration sample {i}: embedding failed ({e}), skipping.")
+                continue
+
+            dv2 = calculate_delta(p_emb, r_emb)
+            resp_len = len(response)
+            lengths.append(resp_len)
+            dv2_values.append(dv2)
+
+        if len(dv2_values) < 10:
+            raise KaariInputError(
+                f"Only {len(dv2_values)} samples embedded successfully. "
+                f"Need at least 10. Check your embedding provider."
+            )
+
+        dv2_arr = np.array(dv2_values)
+        len_arr = np.array(lengths)
+
+        # Clean baseline statistics
+        clean_dv2_mean = float(dv2_arr.mean())
+        clean_dv2_std = float(dv2_arr.std())
+        clean_length_mean = float(len_arr.mean())
+
+        # Compute C2 values using the calibrated mean length
+        for i, (dv2, resp_len) in enumerate(zip(dv2_values, lengths)):
+            c2 = calculate_c2(dv2, resp_len, clean_length_mean)
+            c2_values.append(c2)
+
+        c2_arr = np.array(c2_values)
+        clean_c2_mean = float(c2_arr.mean())
+        clean_c2_std = float(c2_arr.std())
+
+        # Derive thresholds from observed distribution
+        threshold_yellow = clean_c2_mean + sigma_yellow * clean_c2_std
+        threshold_red = clean_c2_mean + sigma_red * clean_c2_std
+        threshold_dv2 = clean_dv2_mean + sigma_red * clean_dv2_std
+
+        # Build calibrated config
+        calibrated_config = {
+            "clean_dv2_mean": round(clean_dv2_mean, 6),
+            "clean_dv2_std": round(clean_dv2_std, 6),
+            "clean_length_mean": round(clean_length_mean, 1),
+            "threshold_dv2": round(threshold_dv2, 6),
+            "threshold_c2": round(threshold_red, 6),
+            "calibrated": True,
+            "n_samples": len(dv2_values),
+            "sigma_yellow": sigma_yellow,
+            "sigma_red": sigma_red,
+            # Derived zone boundaries
+            "_zone_green_max": round(threshold_yellow, 6),
+            "_zone_yellow_max": round(threshold_red, 6),
+            # Stats for inspection
+            "_clean_c2_mean": round(clean_c2_mean, 6),
+            "_clean_c2_std": round(clean_c2_std, 6),
+        }
+
+        # Apply calibration
+        self._config.update(calibrated_config)
+        self._calibrated = True
+        self._baseline_score = clean_c2_mean  # enables deviation_ratio
+        self._zone_green_max = threshold_yellow
+        self._zone_yellow_max = threshold_red
+
+        sys.stderr.write(
+            f"  KAARI: Calibration complete ({len(dv2_values)} samples).\n"
+            f"    Clean C2 baseline: {clean_c2_mean:.4f} ± {clean_c2_std:.4f}\n"
+            f"    Zone boundaries: GREEN < {threshold_yellow:.4f} | "
+            f"YELLOW {threshold_yellow:.4f}-{threshold_red:.4f} | "
+            f"RED >= {threshold_red:.4f}\n"
+            f"    Deviation ratios enabled (1.0× = clean baseline).\n\n"
+        )
+
+        return calibrated_config
+
+    @property
+    def is_calibrated(self) -> bool:
+        """Whether Kaari has been calibrated from user data."""
+        return getattr(self, '_calibrated', False)
+
+    def set_baseline(self, prompt: str, response: str) -> float:
+        """Set the clean baseline from a single known-clean sample.
+
+        Lightweight alternative to calibrate(). Pass one representative
+        clean (prompt, response) pair. Kaari scores it and uses that
+        score as the baseline for deviation_ratio on all future calls.
+
+        Does NOT change zone thresholds (use calibrate() for that).
+        Only enables deviation_ratio reporting.
+
+        Args:
+            prompt:   A known-clean prompt.
+            response: The clean response to that prompt.
+
+        Returns:
+            The baseline C2 score.
+
+        Example:
+            k = kaari.Kaari()
+            k.set_baseline("Summarize this doc. <text>", "The doc shows...")
+            result = k.score(prompt, suspect_response)
+            print(result.deviation_ratio)  # 1.0 = normal, 2.0 = 2x baseline
+        """
+        # Score the clean pair (alerts suppressed — it's calibration)
+        from kaari.core import scoring as _scoring_mod
+        _scoring_mod.TERMINAL_ALERTS_ENABLED = False
+        result = self.score(prompt, response)
+        _scoring_mod.TERMINAL_ALERTS_ENABLED = True
+
+        # Undo the scan count (this was a calibration call, not a real scan)
+        self._scan_counts[result.zone] -= 1
+
+        baseline = result.score
+        if baseline <= 0:
+            baseline = 0.001  # guard against division by zero
+
+        self._baseline_score = baseline
+
+        sys.stderr.write(
+            f"\n  KAARI: Baseline set from clean sample (C2={baseline:.4f}).\n"
+            f"    Deviation ratios will appear in scoring results.\n\n"
+        )
+        return baseline
+
+    @property
+    def has_baseline(self) -> bool:
+        """Whether a clean baseline has been set for deviation_ratio."""
+        return getattr(self, '_baseline_score', None) is not None
+
+    # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
 
@@ -297,14 +529,20 @@ class Kaari:
 
         state = "PAUSED" if self._paused else "ACTIVE"
         threshold = self._config.get("threshold_c2", ZONE_YELLOW_MAX)
+        cal_label = "CALIBRATED" if self.is_calibrated else "DEFAULT"
+        g_max = self._zone_green_max
+        y_max = self._zone_yellow_max
 
         lines = [
             f"",
             f"  KAARI v{__version__} — Status",
             f"  State:      {state}",
             f"  Tier:       {self._tier}",
+            f"  Calibration: {cal_label}" + (
+                f" (n={self._config.get('n_samples', '?')})" if self.is_calibrated else ""
+            ),
             f"  Threshold:  {threshold:.3f}",
-            f"  Zones:      GREEN < {ZONE_GREEN_MAX} | YELLOW {ZONE_GREEN_MAX}-{ZONE_YELLOW_MAX} | RED >= {ZONE_YELLOW_MAX}",
+            f"  Zones:      GREEN < {g_max:.3f} | YELLOW {g_max:.3f}-{y_max:.3f} | RED >= {y_max:.3f}",
             f"  Embedding:  {self._embedding.name}",
             f"  On RED:     {self._on_red if isinstance(self._on_red, str) else 'callback'}",
             f"  Reporting:  {'ON' if self._reporting else 'OFF'}",
@@ -368,6 +606,49 @@ class Kaari:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _reclassify(self, result: ScoringResult) -> ScoringResult:
+        """Re-classify zone using calibrated boundaries.
+
+        Called when user has run calibrate(). Replaces the default
+        zone classification with one based on the observed clean
+        distribution.
+        """
+        from kaari.core.scoring import _emit_zone_alert
+
+        s = result.score
+        if s < self._zone_green_max:
+            zone = "green"
+        elif s < self._zone_yellow_max:
+            zone = "yellow"
+        else:
+            zone = "red"
+
+        injected = zone == "red"
+
+        # Recompute confidence relative to calibrated red threshold
+        threshold = self._zone_yellow_max
+        if threshold > 0:
+            confidence = min(1.0, max(0.0, abs(s - threshold) / threshold))
+        else:
+            confidence = 1.0 if injected else 0.0
+
+        risk = min(100, max(0, int(100 * s / max(threshold * 2, 0.001))))
+
+        # Emit zone alert for the reclassified zone
+        _emit_zone_alert(zone, s, result.tier)
+
+        return ScoringResult(
+            injected=injected,
+            zone=zone,
+            risk=risk,
+            confidence=confidence,
+            score=result.score,
+            delta_v2=result.delta_v2,
+            c2=result.c2,
+            delta_v1=result.delta_v1,
+            tier=result.tier,
+        )
 
     def _handle_red(self, prompt: str, response: str, result: ScoringResult):
         """Handle RED zone detection based on configured policy.

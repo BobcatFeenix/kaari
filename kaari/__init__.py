@@ -1,5 +1,5 @@
 """
-Kaari v0.97 — Intent Vectoring for Prompt Injection Detection
+Kaari v0.98 — Intent Vectoring for Prompt Injection Detection
 =============================================================
 Black-box prompt injection detection via semantic deviation measurement.
 
@@ -7,7 +7,7 @@ Quick start:
     import kaari
 
     k = kaari.Kaari()
-    # -> "KAARI v0.97 online. Detection active (standard tier, threshold 0.245).
+    # -> "KAARI v0.98 online. Detection active (standard tier, threshold 0.245).
     #     GREEN/YELLOW/RED zone alerts will appear here."
 
     result = k.score("What is 2+2?", "The answer is 4.")
@@ -32,7 +32,7 @@ References:
     Detection via Semantic Deviation Measurement."
 """
 
-__version__ = "0.97.0"
+__version__ = "0.98.0"
 
 from kaari.client import Kaari, InjectionDetected
 from kaari.core.scoring import KaariError, KaariInputError

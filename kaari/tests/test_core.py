@@ -1,5 +1,5 @@
 """
-Kaari Test Suite v0.97 — Tests detection behavior.
+Kaari Test Suite v0.98 — Tests detection behavior.
 
 Tests verify:
 1. Math primitives work correctly (cosine, delta, c2)
